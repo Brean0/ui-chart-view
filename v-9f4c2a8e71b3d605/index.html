@@ -649,7 +649,7 @@
       </div>
     </div>
 
-    <!-- Timeframe Switcher -->
+    <!-- Timeframe & Unit Switcher -->
     <div class="controls-row">
       <div class="seg-group" id="winSelector">
         <button class="seg-btn" data-win="trial">Trial</button>
@@ -658,14 +658,27 @@
         <button class="seg-btn active" data-win="90d">90D</button>
         <button class="seg-btn" data-win="all">All</button>
       </div>
+      <div class="seg-group" id="unitSelector" style="flex:0 0 auto;width:86px">
+        <button class="seg-btn active" data-unit="pct">%</button>
+        <button class="seg-btn" data-unit="usd">$</button>
+      </div>
+    </div>
+
+    <!-- Strategy Layer Selector -->
+    <div class="controls-row" style="margin-top:-2px">
+      <div class="seg-group" id="stratSelector">
+        <button class="seg-btn active" data-strat="s6_dip_hold">S6 + Dip Hold</button>
+        <button class="seg-btn" data-strat="s6_dip_rearm">S6 + Dip (+15%)</button>
+        <button class="seg-btn" data-strat="s6_only">S6 Only</button>
+      </div>
     </div>
 
     <!-- Chart 1: Portfolio Equity vs HODL -->
     <div class="chart-card">
       <div class="chart-head">
-        <span class="chart-title">1. Portfolio Value ($) — Bot vs. HODL</span>
+        <span class="chart-title" id="chart1Title">1. Strategy vs. 1.0x HODL</span>
         <div class="chart-legend">
-          <span class="leg-item"><span class="leg-line" style="background:#34d399"></span>My Strategy</span>
+          <span class="leg-item"><span class="leg-line" style="background:#34d399"></span><span id="legStratLbl">S6 + Dip</span></span>
           <span class="leg-item"><span class="leg-line" style="background:#94a3b8"></span>1.0x HODL</span>
         </div>
       </div>
@@ -688,6 +701,7 @@
           <span class="leg-item"><span class="leg-box" style="background:rgba(251,191,36,0.45)"></span>0.8x</span>
           <span class="leg-item" style="color:#34d399">▲ Buy</span>
           <span class="leg-item" style="color:#fbbf24">▼ Sell</span>
+          <span class="leg-item" style="color:#38bdf8">◆ Dip</span>
         </div>
       </div>
       <div class="scrub-bar" id="scrubPrice">
@@ -1300,11 +1314,109 @@
     let STATE = {
       raw: null,
       s6Full: null,
+      high60dFull: null,
       windowKey: CFG.win || "90d",
+      unitMode: CFG.hasCustomPort ? "usd" : "pct",
+      stratMode: "s6_dip_hold",
       view: null,
       hoverIdx: null,
       selectedTrade: null,
     };
+
+    function computeRollingHigh(arr, winBars) {
+      const n = arr.length;
+      const out = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        const s = Math.max(0, i - winBars + 1);
+        let mx = arr[s];
+        for (let j = s + 1; j <= i; j++) {
+          if (arr[j] > mx) mx = arr[j];
+        }
+        out[i] = mx;
+      }
+      return out;
+    }
+
+    function simulateSplitDipSleeve(mFull, high60d, idx0, mWin, spareCash, useRearm15, trialT0) {
+      const n = mWin.closes.length;
+      const pnlCurve = new Float64Array(n);
+      const dipEvents = [];
+      if (spareCash <= 0) return { pnlCurve, dipEvents };
+
+      const slipFrac = 5.0 / 10000.0;
+      let t1Cash = 0.5 * spareCash, t2Cash = 0.5 * spareCash;
+      let t1Sh = 0.0, t2Sh = 0.0;
+      let t1Entry = 0.0, t2Entry = 0.0;
+      let t1WaitReset = false, t2WaitReset = false;
+
+      for (let i = 0; i < n; i++) {
+        const gIdx = idx0 + i;
+        if (i > 0 && gIdx > 0 && (trialT0 === null || mWin.timestamps[i] >= trialT0)) {
+          const prevClose = mFull.closes[gIdx - 1];
+          const prevHigh = Math.max(high60d[gIdx - 1], 1e-9);
+          const prevDd = (prevClose / prevHigh - 1.0) * 100.0;
+          const openPx = mWin.opens[i];
+
+          if (t1WaitReset && prevDd > -10.0) t1WaitReset = false;
+          if (t2WaitReset && prevDd > -10.0) t2WaitReset = false;
+
+          // Tranche 1 (-20% off 60D High)
+          if (t1Sh === 0 && !t1WaitReset && prevDd <= -20.0 && t1Cash > 0) {
+            const fillPx = openPx * (1.0 + slipFrac);
+            t1Sh = t1Cash / fillPx;
+            t1Entry = fillPx;
+            t1Cash = 0.0;
+            dipEvents.push({
+              barIdx: i, timestamp: mWin.timestamps[i], price: fillPx,
+              isDip: true, isBuy: true, label: "◆ Dip Buy #1 (-20%)",
+              detail: `Deployed 50% cash @ $${fillPx.toFixed(2)} (${prevDd.toFixed(1)}% off 60D high)`,
+            });
+          } else if (useRearm15 && t1Sh > 0 && prevClose >= t1Entry * 1.15) {
+            const fillPx = openPx * (1.0 - slipFrac);
+            const proceeds = t1Sh * fillPx;
+            const gain = proceeds - t1Sh * t1Entry;
+            t1Cash = proceeds;
+            t1Sh = 0.0;
+            t1WaitReset = true;
+            dipEvents.push({
+              barIdx: i, timestamp: mWin.timestamps[i], price: fillPx,
+              isDip: true, isBuy: false, label: "◇ Dip +15% Re-Arm #1",
+              detail: `Sold bonus lot #1 @ $${fillPx.toFixed(2)} (+$${gain.toFixed(0)} cash locked)`,
+              realizedSweepUsd: gain,
+            });
+          }
+
+          // Tranche 2 (-30% off 60D High)
+          if (t2Sh === 0 && !t2WaitReset && prevDd <= -30.0 && t2Cash > 0) {
+            const fillPx = openPx * (1.0 + slipFrac);
+            t2Sh = t2Cash / fillPx;
+            t2Entry = fillPx;
+            t2Cash = 0.0;
+            dipEvents.push({
+              barIdx: i, timestamp: mWin.timestamps[i], price: fillPx,
+              isDip: true, isBuy: true, label: "◆ Dip Buy #2 (-30%)",
+              detail: `Deployed 50% cash @ $${fillPx.toFixed(2)} (${prevDd.toFixed(1)}% off 60D high)`,
+            });
+          } else if (useRearm15 && t2Sh > 0 && prevClose >= t2Entry * 1.15) {
+            const fillPx = openPx * (1.0 - slipFrac);
+            const proceeds = t2Sh * fillPx;
+            const gain = proceeds - t2Sh * t2Entry;
+            t2Cash = proceeds;
+            t2Sh = 0.0;
+            t2WaitReset = true;
+            dipEvents.push({
+              barIdx: i, timestamp: mWin.timestamps[i], price: fillPx,
+              isDip: true, isBuy: false, label: "◇ Dip +15% Re-Arm #2",
+              detail: `Sold bonus lot #2 @ $${fillPx.toFixed(2)} (+$${gain.toFixed(0)} cash locked)`,
+              realizedSweepUsd: gain,
+            });
+          }
+        }
+        const sleeveVal = t1Cash + t2Cash + (t1Sh + t2Sh) * mWin.closes[i];
+        pnlCurve[i] = sleeveVal - spareCash;
+      }
+      return { pnlCurve, dipEvents };
+    }
 
     function computeViewForWindow(winKey) {
       const { market, livePx } = STATE.raw;
@@ -1365,12 +1477,22 @@
         wSlice = s6.weights.subarray(idx0);
       }
 
-      const bt = runBacktest(mWin, wSlice, CFG.spotShares * mWin.opens[0], 5.0);
+      const baseSpotVal = CFG.spotShares * mWin.opens[0];
+      const effCash = CFG.subUsdg > 0 ? CFG.subUsdg : (0.10 * baseSpotVal);
+      const bt = runBacktest(mWin, wSlice, baseSpotVal, 5.0);
+
+      let dipRes = { pnlCurve: new Float64Array(mWin.closes.length), dipEvents: [] };
+      if (STATE.stratMode !== "s6_only") {
+        const useRearm = STATE.stratMode === "s6_dip_rearm";
+        dipRes = simulateSplitDipSleeve(mDisplay, STATE.high60dFull, idx0, mWin, effCash, useRearm, trialT0);
+      }
+
       const botCurve = new Float64Array(bt.equityCurve.length);
       const hodlCurve = new Float64Array(bt.hodlCurve.length);
+      const cashDisplay = CFG.subUsdg > 0 ? CFG.subUsdg : effCash;
       for (let i = 0; i < botCurve.length; i++) {
-        botCurve[i] = bt.equityCurve[i] + CFG.subUsdg;
-        hodlCurve[i] = bt.hodlCurve[i] + CFG.subUsdg;
+        botCurve[i] = bt.equityCurve[i] + cashDisplay + dipRes.pnlCurve[i];
+        hodlCurve[i] = bt.hodlCurve[i] + cashDisplay;
       }
 
       return {
@@ -1387,6 +1509,7 @@
         hodlCurve,
         weights: bt.targetWeights,
         trades: bt.tradeLog,
+        dipEvents: dipRes.dipEvents,
         fundingPaid: bt.fundingPaid,
       };
     }
@@ -1418,14 +1541,20 @@
       const ph = h - padT - padB;
       const n = v.timestamps.length;
 
+      const isPct = STATE.unitMode === "pct";
+      const base0 = Math.max(v.hodlCurve[0], 1e-9);
+      const valBot = (i) => isPct ? ((v.botCurve[i] / base0 - 1.0) * 100.0) : v.botCurve[i];
+      const valHodl = (i) => isPct ? ((v.hodlCurve[i] / base0 - 1.0) * 100.0) : v.hodlCurve[i];
+
       let yMin = Infinity, yMax = -Infinity;
       for (let i = 0; i < n; i++) {
-        if (v.botCurve[i] < yMin) yMin = v.botCurve[i];
-        if (v.hodlCurve[i] < yMin) yMin = v.hodlCurve[i];
-        if (v.botCurve[i] > yMax) yMax = v.botCurve[i];
-        if (v.hodlCurve[i] > yMax) yMax = v.hodlCurve[i];
+        const vb = valBot(i), vh = valHodl(i);
+        if (vb < yMin) yMin = vb;
+        if (vh < yMin) yMin = vh;
+        if (vb > yMax) yMax = vb;
+        if (vh > yMax) yMax = vh;
       }
-      const span = Math.max(yMax - yMin, yMax * 0.02, 50);
+      const span = Math.max(yMax - yMin, isPct ? 2.0 : Math.max(yMax * 0.02, 50));
       yMin -= span * 0.08;
       yMax += span * 0.08;
 
@@ -1447,7 +1576,9 @@
         ctx.stroke();
 
         ctx.fillStyle = "#94a3b8";
-        const lbl = Math.abs(yv) >= 10000 ? `$${(yv / 1000).toFixed(1)}k` : fmtUsd(yv, 0);
+        const lbl = isPct
+          ? `${yv >= 0 ? "+" : ""}${yv.toFixed(1)}%`
+          : (Math.abs(yv) >= 10000 ? `$${(yv / 1000).toFixed(1)}k` : fmtUsd(yv, 0));
         ctx.fillText(lbl, padL - 6, py);
       }
 
@@ -1472,14 +1603,14 @@
       // Outperformance Ribbon fill
       ctx.beginPath();
       for (let i = 0; i < n; i++) {
-        const px = xOf(i), py = yOf(v.botCurve[i]);
+        const px = xOf(i), py = yOf(valBot(i));
         if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
       }
       for (let i = n - 1; i >= 0; i--) {
-        ctx.lineTo(xOf(i), yOf(v.hodlCurve[i]));
+        ctx.lineTo(xOf(i), yOf(valHodl(i)));
       }
       ctx.closePath();
-      const endAhead = v.botCurve[n - 1] >= v.hodlCurve[n - 1];
+      const endAhead = valBot(n - 1) >= valHodl(n - 1);
       ctx.fillStyle = endAhead ? "rgba(16, 185, 129, 0.16)" : "rgba(248, 113, 113, 0.14)";
       ctx.fill();
 
@@ -1490,7 +1621,7 @@
       ctx.setLineDash([5, 4]);
       ctx.beginPath();
       for (let i = 0; i < n; i++) {
-        const px = xOf(i), py = yOf(v.hodlCurve[i]);
+        const px = xOf(i), py = yOf(valHodl(i));
         if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
       }
       ctx.stroke();
@@ -1502,7 +1633,7 @@
       ctx.lineJoin = "round";
       ctx.beginPath();
       for (let i = 0; i < n; i++) {
-        const px = xOf(i), py = yOf(v.botCurve[i]);
+        const px = xOf(i), py = yOf(valBot(i));
         if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
       }
       ctx.stroke();
@@ -1536,7 +1667,7 @@
         // HODL dot
         ctx.fillStyle = "#cbd5e1";
         ctx.beginPath();
-        ctx.arc(hx, yOf(v.hodlCurve[hi]), 3.8, 0, Math.PI * 2);
+        ctx.arc(hx, yOf(valHodl(hi)), 3.8, 0, Math.PI * 2);
         ctx.fill();
 
         // Bot dot
@@ -1544,7 +1675,7 @@
         ctx.strokeStyle = "#080c14";
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.arc(hx, yOf(v.botCurve[hi]), 5, 0, Math.PI * 2);
+        ctx.arc(hx, yOf(valBot(hi)), 5, 0, Math.PI * 2);
         ctx.fill();
         ctx.stroke();
       }
@@ -1675,6 +1806,34 @@
         drawTriangle(ctx, tx, ty + offset, isSel ? 7.5 : 5.6, isBuy, col);
       }
 
+      // 6. Spare-Cash Dip-Lot Pins (Cyan Diamonds ◆ / ◇)
+      for (const dev of (v.dipEvents || [])) {
+        const idx = dev.barIdx;
+        if (idx < 0 || idx >= n) continue;
+        const tx = xOf(idx);
+        const ty = yOf(dev.price) + (dev.isBuy ? 14 : -14);
+        const r = (STATE.selectedTrade && STATE.selectedTrade.timestamp === dev.timestamp) ? 7.2 : 5.6;
+        ctx.beginPath();
+        ctx.moveTo(tx, ty - r);
+        ctx.lineTo(tx + r, ty);
+        ctx.lineTo(tx, ty + r);
+        ctx.lineTo(tx - r, ty);
+        ctx.closePath();
+        if (dev.isBuy) {
+          ctx.fillStyle = "#38bdf8";
+          ctx.fill();
+          ctx.strokeStyle = "#080c14";
+          ctx.lineWidth = 1.4;
+          ctx.stroke();
+        } else {
+          ctx.fillStyle = "#080c14";
+          ctx.fill();
+          ctx.strokeStyle = "#38bdf8";
+          ctx.lineWidth = 2.0;
+          ctx.stroke();
+        }
+      }
+
       // X-axis Dates
       ctx.fillStyle = "#94a3b8";
       ctx.textBaseline = "top";
@@ -1720,31 +1879,46 @@
 
       const botVal = v.botCurve[idx];
       const hodlVal = v.hodlCurve[idx];
+      const base0 = Math.max(v.hodlCurve[0], 1e-9);
+      const botPct = (botVal / base0 - 1.0) * 100.0;
+      const hodlPct = (hodlVal / base0 - 1.0) * 100.0;
       const diffUsd = botVal - hodlVal;
       const diffPct = hodlVal > 0 ? (diffUsd / hodlVal) * 100.0 : 0.0;
       const px = v.prices[idx];
       const extraSh = px > 0 ? diffUsd / px : 0.0;
       const regimeW = v.weights[idx];
+      const isPct = STATE.unitMode === "pct";
 
-      document.getElementById("lblBotVal").textContent = isScrubbing ? "Bot @ Scrub" : "My Bot Strategy";
+      const stratShort = STATE.stratMode === "s6_only"
+        ? "S6 Only"
+        : (STATE.stratMode === "s6_dip_rearm" ? "S6 + Dip (+15%)" : "S6 + Dip Hold");
+      document.getElementById("legStratLbl").textContent = stratShort;
+      document.getElementById("chart1Title").textContent =
+        isPct ? `1. Cumulative Return (%) — ${stratShort} vs HODL` : `1. Portfolio Value ($) — ${stratShort} vs HODL`;
+
+      document.getElementById("lblBotVal").textContent = isScrubbing ? `${stratShort} @ Scrub` : stratShort;
       document.getElementById("lblHodlVal").textContent = isScrubbing ? "HODL @ Scrub" : "1.0x Pure HODL";
       document.getElementById("lblAlpha").textContent = isScrubbing ? "Edge @ Scrub" : `Edge (${v.winKey.toUpperCase()})`;
 
-      document.getElementById("kpiBotVal").textContent = fmtUsd(botVal, 0);
-      document.getElementById("kpiBotSub").textContent = `${CFG.spotShares} SPCX` + (CFG.subUsdg > 0 ? ` + ${fmtUsd(CFG.subUsdg, 0)} cash` : "");
+      document.getElementById("kpiBotVal").textContent = isPct ? `${botPct >= 0 ? "+" : ""}${botPct.toFixed(2)}%` : fmtUsd(botVal, 0);
+      document.getElementById("kpiBotSub").textContent = isPct
+        ? (CFG.hasCustomPort ? fmtUsd(botVal, 0) : "Share-independent %")
+        : (`${CFG.spotShares} SPCX` + (CFG.subUsdg > 0 ? ` + ${fmtUsd(CFG.subUsdg, 0)} cash` : ""));
 
-      document.getElementById("kpiHodlVal").textContent = fmtUsd(hodlVal, 0);
+      document.getElementById("kpiHodlVal").textContent = isPct ? `${hodlPct >= 0 ? "+" : ""}${hodlPct.toFixed(2)}%` : fmtUsd(hodlVal, 0);
       document.getElementById("kpiHodlSub").textContent = isScrubbing ? fmtDateTime(v.timestamps[idx]) : v.winLabel;
 
       const elAlpha = document.getElementById("kpiAlpha");
-      elAlpha.textContent = fmtSignedUsd(diffUsd, 0);
+      elAlpha.textContent = isPct ? `${diffPct >= 0 ? "+" : ""}${diffPct.toFixed(2)}%` : fmtSignedUsd(diffUsd, 0);
       elAlpha.className = "kpi-val " + (diffUsd >= 0 ? "c-green" : "c-red");
-      document.getElementById("kpiAlphaSub").textContent =
-        `${diffPct >= 0 ? "+" : ""}${diffPct.toFixed(2)}% (${extraSh >= 0 ? "+" : ""}${extraSh.toFixed(2)} SPCX)`;
+      document.getElementById("kpiAlphaSub").textContent = isPct
+        ? (CFG.hasCustomPort ? `${fmtSignedUsd(diffUsd, 0)} (${extraSh >= 0 ? "+" : ""}${extraSh.toFixed(2)} SPCX)` : "Active outperformance")
+        : `${diffPct >= 0 ? "+" : ""}${diffPct.toFixed(2)}% (${extraSh >= 0 ? "+" : ""}${extraSh.toFixed(2)} SPCX)`;
 
       const buys = v.trades.filter(t => t.toTranche > t.fromTranche).length;
       const sells = v.trades.length - buys;
-      document.getElementById("kpiShifts").textContent = `${buys} ▲ · ${sells} ▼`;
+      const dips = (v.dipEvents || []).length;
+      document.getElementById("kpiShifts").textContent = dips > 0 ? `${buys}▲ ${sells}▼ · ${dips}◆` : `${buys} ▲ · ${sells} ▼`;
       const fYr = v.af12[idx];
       document.getElementById("kpiFundSub").textContent = `12h Fund: ${fYr >= 0 ? "+" : ""}${fYr.toFixed(1)}%/yr`;
 
@@ -1752,16 +1926,19 @@
       const eqBar = document.getElementById("scrubEquity");
       const pxBar = document.getElementById("scrubPrice");
       if (isScrubbing) {
+        const bTxt = isPct ? `${botPct >= 0 ? "+" : ""}${botPct.toFixed(2)}%` : fmtUsd(botVal, 0);
+        const hTxt = isPct ? `${hodlPct >= 0 ? "+" : ""}${hodlPct.toFixed(2)}%` : fmtUsd(hodlVal, 0);
+        const dTxt = isPct ? `${diffPct >= 0 ? "+" : ""}${diffPct.toFixed(2)}%` : fmtSignedUsd(diffUsd, 0);
         eqBar.innerHTML =
           `<span style="color:#f1f5f9;font-weight:700">${fmtDateTime(v.timestamps[idx])}</span>` +
-          `<span>Bot <b class="c-green">${fmtUsd(botVal, 0)}</b> · HODL <b>${fmtUsd(hodlVal, 0)}</b> · <b class="${diffUsd >= 0 ? 'c-green' : 'c-red'}">${fmtSignedUsd(diffUsd, 0)}</b></span>`;
+          `<span>Strat <b class="c-green">${bTxt}</b> · HODL <b>${hTxt}</b> · <b class="${diffUsd >= 0 ? 'c-green' : 'c-red'}">${dTxt}</b></span>`;
         const regTxt = regimeW > 1.05 ? "1.20x BOOST" : (regimeW < 0.95 ? "0.80x HEDGE" : "1.00x SPOT");
         pxBar.innerHTML =
           `<span style="color:#f1f5f9;font-weight:700">SPCX $${px.toFixed(2)}</span>` +
           `<span>10D MA <b class="c-cyan">$${v.ema10d[idx].toFixed(2)}</b> · Regime <b>${regTxt}</b></span>`;
       } else {
         eqBar.innerHTML = `<span>Drag finger or cursor to scrub · ${v.winLabel}</span>`;
-        pxBar.innerHTML = `<span>Tap any ▲ Buy / ▼ Sell pin or trade row below</span>`;
+        pxBar.innerHTML = `<span>Tap ▲/▼ S6 shifts or ◆ Dip pins to inspect</span>`;
       }
     }
 
@@ -1831,11 +2008,30 @@
       const condL2Trend = condL2Gain && condL2Stack && condL2FundOk;
 
       const mood = f12 >= 14.0 ? "Crowded Long" : (f12 <= -2.0 ? "Crowded Short" : "Calm & Balanced");
+      const h60 = STATE.high60dFull ? STATE.high60dFull[i] : px;
+      const dd60 = (px / Math.max(h60, 1e-9) - 1.0) * 100.0;
+      const dipT1Px = h60 * 0.80;
+      const dipT2Px = h60 * 0.70;
+      const halfLbl = CFG.subUsdg > 0 ? fmtUsd(0.5 * CFG.subUsdg, 0) : "50% Cash";
 
       document.getElementById("triggersContent").innerHTML = `
         <div class="sec-title">
           <span>Live Signal Checklist (Last Closed 1h Bar)</span>
           <span class="c-cyan">$${px.toFixed(2)}</span>
+        </div>
+        <div class="cond-group">
+          <div class="cond-hdr">
+            <span class="c-cyan">◆ Spare-Cash Dip-Lot Rule (Core Untouched)</span>
+            <span>${dd60.toFixed(1)}% vs 60D High ($${h60.toFixed(2)})</span>
+          </div>
+          <div class="cond-line">
+            <span>Half #1 (${halfLbl}) @ -20% (&le; $${dipT1Px.toFixed(2)})</span>
+            <span class="cond-val">${dd60 <= -20.0 ? 'IN ZONE' : 'Wait'} ${chk(dd60 <= -20.0)}</span>
+          </div>
+          <div class="cond-line">
+            <span>Half #2 (${halfLbl}) @ -30% (&le; $${dipT2Px.toFixed(2)})</span>
+            <span class="cond-val">${dd60 <= -30.0 ? 'IN ZONE' : 'Wait'} ${chk(dd60 <= -30.0)}</span>
+          </div>
         </div>
         <div class="cond-group">
           <div class="cond-hdr">
@@ -1889,23 +2085,46 @@
     function renderTradeLogPane() {
       const v = STATE.view;
       const listEl = document.getElementById("tradeList");
-      document.getElementById("tradeListTitle").textContent =
-        `${v.trades.length} Shifts in ${v.winLabel}`;
+      const combined = [
+        ...v.trades.map(t => ({ ...t, isDip: false })),
+        ...(v.dipEvents || []),
+      ].sort((a, b) => b.timestamp - a.timestamp);
 
-      if (!v.trades.length) {
-        listEl.innerHTML = `<div class="status-banner">0 tranche shifts in this window — holding steady at 1.00x Spot ($0 funding).</div>`;
+      document.getElementById("tradeListTitle").textContent =
+        `${combined.length} Events in ${v.winLabel}`;
+
+      if (!combined.length) {
+        listEl.innerHTML = `<div class="status-banner">0 shifts in this window — holding steady at 1.00x Spot ($0 funding).</div>`;
         return;
       }
 
-      const rev = v.trades.slice().reverse();
-      listEl.innerHTML = rev.map((tr) => {
+      listEl.innerHTML = combined.map((tr) => {
+        if (tr.isDip) {
+          const sweep = tr.realizedSweepUsd || 0;
+          const rightSub = Math.abs(sweep) >= 0.5
+            ? `<div style="font-size:11px" class="c-green">${fmtSignedUsd(sweep, 0)} locked</div>`
+            : `<div style="font-size:11px;color:var(--cyan)">Spare cash lot</div>`;
+          return `
+            <div class="trade-row" data-bidx="${tr.barIdx}" data-ts="${tr.timestamp}">
+              <span class="trade-badge" style="background:rgba(56,189,248,0.16);color:#38bdf8;border:1px solid rgba(56,189,248,0.4)">${tr.isBuy ? '◆ DIP' : '◇ +15%'}</span>
+              <div class="trade-mid">
+                <div class="trade-main">${tr.label}</div>
+                <div class="trade-time">${fmtDateTime(tr.timestamp)}</div>
+              </div>
+              <div class="trade-right">
+                <div style="font-weight:700">$${tr.price.toFixed(2)}</div>
+                ${rightSub}
+              </div>
+            </div>
+          `;
+        }
         const isBuy = tr.toTranche > tr.fromTranche;
         const badgeCls = isBuy ? "tb-buy" : "tb-sell";
         const badgeTxt = isBuy ? "▲ BUY" : "▼ SELL";
         const sweep = tr.realizedSweepUsd || 0;
         const sweepHtml = Math.abs(sweep) >= 0.5
           ? `<div style="font-size:11px" class="${sweep >= 0 ? 'c-green' : 'c-red'}">${fmtSignedUsd(sweep, 0)} settled</div>`
-          : `<div style="font-size:11px;color:var(--muted)">Entry shift</div>`;
+          : `<div style="font-size:11px;color:var(--muted)">S6 shift</div>`;
         return `
           <div class="trade-row" data-bidx="${tr.barIdx}" data-ts="${tr.timestamp}">
             <span class="trade-badge ${badgeCls}">${badgeTxt}</span>
@@ -1925,7 +2144,7 @@
         el.addEventListener("click", () => {
           const bIdx = parseInt(el.getAttribute("data-bidx"), 10);
           const ts = parseInt(el.getAttribute("data-ts"), 10);
-          const tr = v.trades.find(t => t.timestamp === ts);
+          const tr = combined.find(t => t.timestamp === ts);
           hapticTick();
           STATE.hoverIdx = bIdx;
           STATE.selectedTrade = tr || null;
@@ -1944,10 +2163,12 @@
         toast.className = "trade-toast";
         return;
       }
-      const isBuy = tr.toTranche > tr.fromTranche;
+      const descHtml = tr.isDip
+        ? `<span><b class="c-cyan">${tr.label}</b> · <b>$${tr.price.toFixed(2)}</b> (${fmtDateTime(tr.timestamp)})</span>`
+        : `<span><b class="${tr.toTranche > tr.fromTranche ? 'c-green' : 'c-amber'}">${tr.toTranche > tr.fromTranche ? '▲ Buy' : '▼ Sell'}</b> · ${tr.fromTranche.toFixed(2)}x → ${tr.toTranche.toFixed(2)}x @ <b>$${tr.price.toFixed(2)}</b> (${fmtDateTime(tr.timestamp)})</span>`;
       toast.className = "trade-toast visible";
       toast.innerHTML = `
-        <span><b class="${isBuy ? 'c-green' : 'c-amber'}">${isBuy ? '▲ Buy' : '▼ Sell'}</b> · ${tr.fromTranche.toFixed(2)}x → ${tr.toTranche.toFixed(2)}x @ <b>$${tr.price.toFixed(2)}</b> (${fmtDateTime(tr.timestamp)})</span>
+        ${descHtml}
         <button class="icon-btn" style="width:24px;height:24px;font-size:12px" id="closeToastBtn">✕</button>
       `;
       const btn = document.getElementById("closeToastBtn");
@@ -2073,12 +2294,13 @@
       if (allowPinSnap) {
         cv.addEventListener("click", (e) => {
           const v = STATE.view;
-          if (!v || !v.trades.length) return;
+          const allPins = [...v.trades, ...(v.dipEvents || [])];
+          if (!allPins.length) return;
           const idx = idxFromClientX(e.clientX);
           if (idx === null) return;
           let best = null, bestDist = Infinity;
           const maxSnapBars = Math.max(3, Math.round(v.timestamps.length * 0.03));
-          for (const tr of v.trades) {
+          for (const tr of allPins) {
             const d = Math.abs(tr.barIdx - idx);
             if (d <= maxSnapBars && d < bestDist) {
               best = tr;
@@ -2119,6 +2341,38 @@
       });
     });
 
+    document.querySelectorAll("#unitSelector .seg-btn").forEach((btn) => {
+      if (btn.getAttribute("data-unit") === STATE.unitMode) {
+        document.querySelectorAll("#unitSelector .seg-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+      }
+      btn.addEventListener("click", () => {
+        const u = btn.getAttribute("data-unit");
+        if (!STATE.raw) return;
+        hapticTick();
+        document.querySelectorAll("#unitSelector .seg-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        STATE.unitMode = u;
+        renderAllPanels();
+      });
+    });
+
+    document.querySelectorAll("#stratSelector .seg-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const sm = btn.getAttribute("data-strat");
+        if (!STATE.raw) return;
+        hapticTick();
+        document.querySelectorAll("#stratSelector .seg-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        STATE.stratMode = sm;
+        STATE.hoverIdx = null;
+        STATE.selectedTrade = null;
+        showTradeToast(null);
+        STATE.view = computeViewForWindow(STATE.windowKey);
+        renderAllPanels();
+      });
+    });
+
     document.querySelectorAll("#tabsBar .tab-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
         const tab = btn.getAttribute("data-tab");
@@ -2153,6 +2407,7 @@
         const raw = await loadMarketData(false);
         STATE.raw = raw;
         STATE.s6Full = stratS6CarryShield(raw.market, S6_PARAMS);
+        STATE.high60dFull = computeRollingHigh(raw.market.closes, 1440);
         STATE.view = computeViewForWindow(STATE.windowKey);
         renderAllPanels();
       } catch (err) {
