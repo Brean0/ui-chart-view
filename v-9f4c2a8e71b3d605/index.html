@@ -652,10 +652,10 @@
     <!-- Timeframe & Unit Switcher -->
     <div class="controls-row">
       <div class="seg-group" id="winSelector">
-        <button class="seg-btn" data-win="trial">Trial</button>
+        <button class="seg-btn active" data-win="trial">Trial</button>
         <button class="seg-btn" data-win="14d">14D</button>
         <button class="seg-btn" data-win="30d">30D</button>
-        <button class="seg-btn active" data-win="90d">90D</button>
+        <button class="seg-btn" data-win="90d">90D</button>
         <button class="seg-btn" data-win="all">All</button>
       </div>
       <div class="seg-group" id="unitSelector" style="flex:0 0 auto;width:86px">
@@ -667,9 +667,9 @@
     <!-- Strategy Layer Selector -->
     <div class="controls-row" style="margin-top:-2px">
       <div class="seg-group" id="stratSelector">
-        <button class="seg-btn active" data-strat="s6_dip_hold">S6 + Dip Hold</button>
+        <button class="seg-btn active" data-strat="s6_only">S6 Only</button>
+        <button class="seg-btn" data-strat="s6_dip_hold">S6 + Cash Dip</button>
         <button class="seg-btn" data-strat="s6_dip_rearm">S6 + Dip (+15%)</button>
-        <button class="seg-btn" data-strat="s6_only">S6 Only</button>
       </div>
     </div>
 
@@ -796,7 +796,7 @@
         subUsdg: parseFloat(pick("u") ?? saved.subUsdg ?? "0"),
         trialStartTs: parseInt(pick("t0") ?? saved.trialStartTs ?? "0", 10) || 0,
         venue: (pick("v") || saved.venue || "rh").toLowerCase(),
-        win: (pick("w") || "90d").toLowerCase(),
+        win: (pick("w") || "trial").toLowerCase(),
       };
       if (!Number.isFinite(cfg.spotShares) || cfg.spotShares <= 0) cfg.spotShares = 1;
       if (!Number.isFinite(cfg.subSpcx) || cfg.subSpcx < 0) cfg.subSpcx = 0;
@@ -1315,9 +1315,9 @@
       raw: null,
       s6Full: null,
       high60dFull: null,
-      windowKey: CFG.win || "90d",
+      windowKey: CFG.win || "trial",
       unitMode: CFG.hasCustomPort ? "usd" : "pct",
-      stratMode: "s6_dip_hold",
+      stratMode: "s6_only",
       view: null,
       hoverIdx: null,
       selectedTrade: null,
@@ -1449,22 +1449,22 @@
 
       if (winKey === "14d") {
         idx0 = Math.max(0, nFull - 14 * 24);
-        winLabel = "Last 14 Days";
+        winLabel = "14D (Backtest)";
       } else if (winKey === "30d") {
         idx0 = Math.max(0, nFull - 30 * 24);
-        winLabel = "Last 30 Days";
+        winLabel = "30D (Backtest)";
       } else if (winKey === "all") {
         idx0 = 0;
-        winLabel = `Full History (${Math.round(nFull / 24)}d)`;
+        winLabel = `Full ${Math.round(nFull / 24)}d (Backtest)`;
       } else if (winKey === "trial") {
         trialT0 = CFG.trialStartTs > 0 ? CFG.trialStartTs : (market.timestamps[nFull - 1] - 48 * 3600);
         const minCtxTs = Math.min(trialT0, market.timestamps[nFull - 1] - 7 * 86400);
         idx0 = 0;
         while (idx0 < nFull - 24 && market.timestamps[idx0] < minCtxTs) idx0++;
-        winLabel = "Live Paper Trial (7d Context)";
+        winLabel = "Live Forward Trial";
       } else {
         idx0 = Math.max(0, nFull - 90 * 24);
-        winLabel = "Last 90 Days";
+        winLabel = "90D (Backtest)";
       }
 
       const mWin = sliceMarket(mDisplay, idx0);
@@ -1481,10 +1481,18 @@
       const effCash = CFG.subUsdg > 0 ? CFG.subUsdg : (0.10 * baseSpotVal);
       const bt = runBacktest(mWin, wSlice, baseSpotVal, 5.0);
 
+      let anchorIdx = 0;
+      if (trialT0 !== null) {
+        while (anchorIdx < mWin.timestamps.length - 1 && mWin.timestamps[anchorIdx] < trialT0) {
+          anchorIdx++;
+        }
+      }
+      // In Live Trial mode, Dip-Lot only triggers forward from now (never retroactively before idea creation)
+      const dipStartTs = trialT0 !== null ? Math.max(trialT0, mDisplay.timestamps[nFull - 1]) : null;
       let dipRes = { pnlCurve: new Float64Array(mWin.closes.length), dipEvents: [] };
       if (STATE.stratMode !== "s6_only") {
         const useRearm = STATE.stratMode === "s6_dip_rearm";
-        dipRes = simulateSplitDipSleeve(mDisplay, STATE.high60dFull, idx0, mWin, effCash, useRearm, trialT0);
+        dipRes = simulateSplitDipSleeve(mDisplay, STATE.high60dFull, idx0, mWin, effCash, useRearm, dipStartTs);
       }
 
       const botCurve = new Float64Array(bt.equityCurve.length);
@@ -1499,6 +1507,7 @@
         winKey,
         winLabel,
         idx0,
+        anchorIdx,
         trialT0,
         timestamps: mWin.timestamps,
         prices: mWin.closes,
@@ -1542,7 +1551,7 @@
       const n = v.timestamps.length;
 
       const isPct = STATE.unitMode === "pct";
-      const base0 = Math.max(v.hodlCurve[0], 1e-9);
+      const base0 = Math.max(v.hodlCurve[v.anchorIdx || 0], 1e-9);
       const valBot = (i) => isPct ? ((v.botCurve[i] / base0 - 1.0) * 100.0) : v.botCurve[i];
       const valHodl = (i) => isPct ? ((v.hodlCurve[i] / base0 - 1.0) * 100.0) : v.hodlCurve[i];
 
@@ -1879,7 +1888,7 @@
 
       const botVal = v.botCurve[idx];
       const hodlVal = v.hodlCurve[idx];
-      const base0 = Math.max(v.hodlCurve[0], 1e-9);
+      const base0 = Math.max(v.hodlCurve[v.anchorIdx || 0], 1e-9);
       const botPct = (botVal / base0 - 1.0) * 100.0;
       const hodlPct = (hodlVal / base0 - 1.0) * 100.0;
       const diffUsd = botVal - hodlVal;
